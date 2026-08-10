@@ -11,6 +11,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 <style>
 :root{
   --bg:#0A0E16;
@@ -493,6 +494,9 @@ main{padding:4px 16px 24px;}
 const SPOTIFY_CLIENT_ID = 'f88babde854d48108ec6b440f1785c5a';
 const SPOTIFY_CLIENT_SECRET = '15648ab41ac64f0490874ca1e77e134a';
 const LASTFM_API_KEY = '7b411ff45f35b3660a83fed213634a16';
+const SUPABASE_URL = 'https://kpromdiourvbwfawwoqc.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imtwcm9tZGlvdXJ2YndmYXd3b3FjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODYzNTM5NTcsImV4cCI6MjEwMTkyOTk1N30.PgY2nV9TGZPbTm9k31ud_55g_4eeW1YLJptUDSAUUno';
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 /* ---------------- Auth ---------------- */
 async function getToken(){
@@ -626,24 +630,38 @@ async function getTopArtistsForTag(tag, limit=8){
   }
 }
 
-/* ---------------- Local storage: lists ---------------- */
-const STORE_KEY = 'crate_data_v1';
+/* ---------------- Store: Supabase (fonte de verdade) + cache em memória ---------------- */
 const DEFAULT_LISTS_SORT = { by: 'created', dir: 'desc' };
-function loadStore(){
-  try{
-    const raw = localStorage.getItem(STORE_KEY);
-    if(!raw) return { lists: {}, albums: {}, listOrder: [], listsSort: { ...DEFAULT_LISTS_SORT } };
-    const parsed = JSON.parse(raw);
-    if(!parsed.listsSort) parsed.listsSort = { ...DEFAULT_LISTS_SORT };
-    return parsed;
-  }catch(e){ return { lists: {}, albums: {}, listOrder: [], listsSort: { ...DEFAULT_LISTS_SORT } }; }
-}
-function saveStore(store){
-  localStorage.setItem(STORE_KEY, JSON.stringify(store));
-}
-let store = loadStore();
+let store = { lists: {}, albums: {}, listOrder: [], listsSort: { ...DEFAULT_LISTS_SORT } };
 
-function upsertAlbumCache(album){
+async function bootstrapStore(){
+  const [{ data: lists, error: e1 }, { data: items, error: e2 }, { data: albumRows, error: e3 }, { data: settings, error: e4 }] = await Promise.all([
+    sb.from('albums_lists').select('*').order('created_at', { ascending: false }),
+    sb.from('albums_list_items').select('*').order('added_at', { ascending: true }),
+    sb.from('albums_albums').select('*'),
+    sb.from('albums_settings').select('*')
+  ]);
+  if(e1 || e2 || e3 || e4) throw (e1 || e2 || e3 || e4);
+
+  (albumRows || []).forEach(row => {
+    store.albums[row.id] = {
+      id: row.id, name: row.name, image: row.image || '',
+      artist: row.artist || '', artistId: row.artist_id || '', releaseDate: row.release_date || ''
+    };
+  });
+  (lists || []).forEach(row => {
+    store.lists[row.id] = { id: row.id, name: row.name, sortOrder: row.sort_order, albumIds: [] };
+    store.listOrder.push(row.id); // já vem mais recente primeiro (order by created_at desc)
+  });
+  (items || []).forEach(row => {
+    const list = store.lists[row.list_id];
+    if(list) list.albumIds.push(row.album_id); // added_at ascending preserva ordem cronológica
+  });
+  const sortSetting = (settings || []).find(s => s.key === 'lists_sort');
+  if(sortSetting && sortSetting.value) store.listsSort = sortSetting.value;
+}
+
+function cacheAlbum(album){
   store.albums[album.id] = {
     id: album.id,
     name: album.name,
@@ -653,19 +671,36 @@ function upsertAlbumCache(album){
     releaseDate: album.release_date || ''
   };
 }
-function createList(name){
-  const id = 'l_' + Date.now();
-  store.lists[id] = { id, name, createdAt: Date.now(), albumIds: [], sortOrder: 'newest' };
-  store.listOrder.unshift(id);
-  saveStore(store);
-  return id;
+async function persistAlbum(albumId){
+  const a = store.albums[albumId];
+  if(!a) return;
+  const { error } = await sb.from('albums_albums').upsert({
+    id: a.id, name: a.name, image: a.image, artist: a.artist,
+    artist_id: a.artistId, release_date: a.releaseDate
+  });
+  if(error) console.error(error);
 }
-function toggleAlbumInList(listId, albumId){
+async function createList(name){
+  const { data, error } = await sb.from('albums_lists').insert({ name }).select().single();
+  if(error){ console.error(error); toast('Não deu pra criar a lista agora'); return null; }
+  store.lists[data.id] = { id: data.id, name: data.name, sortOrder: data.sort_order, albumIds: [] };
+  store.listOrder.unshift(data.id);
+  return data.id;
+}
+async function toggleAlbumInList(listId, albumId){
   const list = store.lists[listId];
+  if(!list) return;
   const idx = list.albumIds.indexOf(albumId);
-  if(idx === -1) list.albumIds.push(albumId); // sempre grava em ordem cronológica de adição
-  else list.albumIds.splice(idx, 1);
-  saveStore(store);
+  if(idx === -1){
+    list.albumIds.push(albumId); // otimista; ordem cronológica de adição
+    await persistAlbum(albumId);
+    const { error } = await sb.from('albums_list_items').insert({ list_id: listId, album_id: albumId });
+    if(error && error.code !== '23505') console.error(error); // 23505 = já estava na lista
+  } else {
+    list.albumIds.splice(idx, 1);
+    const { error } = await sb.from('albums_list_items').delete().eq('list_id', listId).eq('album_id', albumId);
+    if(error) console.error(error);
+  }
 }
 function isAlbumInAnyList(albumId){
   return Object.values(store.lists).some(l => l.albumIds.includes(albumId));
@@ -682,21 +717,35 @@ function getSortedListIds(){
     sorted = [...ids].sort((a, b) => store.lists[a].name.localeCompare(store.lists[b].name, 'pt-BR', { sensitivity: 'base' }));
     if(sort.dir === 'desc') sorted.reverse();
   } else {
-    sorted = [...ids]; // store.listOrder já nasce mais recente primeiro (unshift na criação)
+    sorted = [...ids]; // store.listOrder já nasce mais recente primeiro
     if(sort.dir === 'asc') sorted.reverse();
   }
   return sorted;
 }
-function deleteList(listId){
+async function deleteList(listId){
   delete store.lists[listId];
   store.listOrder = store.listOrder.filter(id => id !== listId);
-  saveStore(store);
+  const { error } = await sb.from('albums_lists').delete().eq('id', listId);
+  if(error) console.error(error);
 }
-function renameList(listId, newName){
+async function renameList(listId, newName){
   const list = store.lists[listId];
   if(!list) return;
   list.name = newName;
-  saveStore(store);
+  const { error } = await sb.from('albums_lists').update({ name: newName }).eq('id', listId);
+  if(error) console.error(error);
+}
+async function setListSortOrder(listId, sortOrder){
+  const list = store.lists[listId];
+  if(!list) return;
+  list.sortOrder = sortOrder;
+  const { error } = await sb.from('albums_lists').update({ sort_order: sortOrder }).eq('id', listId);
+  if(error) console.error(error);
+}
+async function setListsSort(by, dir){
+  store.listsSort = { by, dir };
+  const { error } = await sb.from('albums_settings').upsert({ key: 'lists_sort', value: store.listsSort });
+  if(error) console.error(error);
 }
 function refreshAfterListMutation(){
   if(currentListId && document.getElementById('view-list').classList.contains('active')){
@@ -881,8 +930,7 @@ async function renderDiscoveryShelf(){
   }).slice(0, 40);
   if(!albums.length){ wrap.innerHTML = ''; return; }
 
-  albums.forEach(upsertAlbumCache);
-  saveStore(store);
+  albums.forEach(cacheAlbum);
   wrap.innerHTML = `
     <div class="section-title">Sugestões baseadas nas suas listas</div>
     <div class="grid">${albums.map(albumCardHTML).join('')}</div>
@@ -927,8 +975,7 @@ async function runSearch(q){
   grid.innerHTML = `<div class="grid-loading"><div class="spinner"></div></div>`;
   try{
     const albums = await searchAlbums(q);
-    albums.forEach(upsertAlbumCache);
-    saveStore(store);
+    albums.forEach(cacheAlbum);
     if(albums.length === 0){
       grid.innerHTML = `<div class="grid-empty">Nada encontrado pra "${escapeHtml(q)}"</div>`;
       return;
@@ -949,8 +996,7 @@ async function openAlbum(id){
   content.innerHTML = `<div class="grid-loading"><div class="spinner"></div></div>`;
   try{
     const album = await getAlbum(id);
-    upsertAlbumCache(album);
-    saveStore(store);
+    cacheAlbum(album);
     const artistName = album.artists.map(a=>a.name).join(', ');
     const artistId = album.artists[0].id;
     const img = album.images[0] ? album.images[0].url : '';
@@ -1017,8 +1063,7 @@ async function renderMoreFromArtistShelf(album){
       .sort((a,b) => (b.release_date||'').localeCompare(a.release_date||''))
       .slice(0, 10);
     if(!others.length){ wrap.innerHTML = ''; return; }
-    others.forEach(upsertAlbumCache);
-    saveStore(store);
+    others.forEach(cacheAlbum);
     wrap.innerHTML = `
       <div class="section-title">Mais desse artista</div>
       <div class="grid">${others.map(albumCardHTML).join('')}</div>
@@ -1072,8 +1117,7 @@ async function renderSimilarArtistsShelf(album){
   }).slice(0, 10);
   if(!albums.length){ wrap.innerHTML = ''; return; }
 
-  albums.forEach(upsertAlbumCache);
-  saveStore(store);
+  albums.forEach(cacheAlbum);
   wrap.innerHTML = `
     <div class="section-title">Você também pode gostar</div>
     <div class="grid">${albums.map(albumCardHTML).join('')}</div>
@@ -1136,8 +1180,7 @@ async function openArtist(id){
     }
 
     content.innerHTML = html;
-    deduped.forEach(upsertAlbumCache);
-    saveStore(store);
+    deduped.forEach(cacheAlbum);
     bindCardEvents(content);
   }catch(err){
     content.innerHTML = `<div class="grid-empty">Não deu pra carregar esse artista agora.</div>`;
@@ -1199,16 +1242,14 @@ function renderListsTab(){
     });
   });
   wrap.querySelectorAll('[data-sortby]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      store.listsSort.by = btn.dataset.sortby;
-      saveStore(store);
+    btn.addEventListener('click', async () => {
+      await setListsSort(btn.dataset.sortby, store.listsSort.dir);
       renderListsTab();
     });
   });
   wrap.querySelectorAll('[data-sortdir]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      store.listsSort.dir = btn.dataset.sortdir;
-      saveStore(store);
+    btn.addEventListener('click', async () => {
+      await setListsSort(store.listsSort.by, btn.dataset.sortdir);
       renderListsTab();
     });
   });
@@ -1229,11 +1270,11 @@ document.getElementById('newListConfirmBtn').addEventListener('click', confirmNe
 document.getElementById('newListNameInput').addEventListener('keydown', (e) => {
   if(e.key === 'Enter') confirmNewList();
 });
-function confirmNewList(){
+async function confirmNewList(){
   const input = document.getElementById('newListNameInput');
   const name = input.value.trim();
   if(!name) return;
-  createList(name);
+  await createList(name);
   newListModalBackdrop.classList.remove('open');
   refreshAfterListMutation();
   toast('Lista criada');
@@ -1278,11 +1319,11 @@ function renderListActionsRename(){
   input.addEventListener('keydown', (e) => { if(e.key === 'Enter') confirmRenameList(); });
   document.getElementById('renameListConfirmBtn').addEventListener('click', confirmRenameList);
 }
-function confirmRenameList(){
+async function confirmRenameList(){
   const input = document.getElementById('renameListInput');
   const name = input.value.trim();
   if(!name) return;
-  renameList(listActionsTargetId, name);
+  await renameList(listActionsTargetId, name);
   listActionsBackdrop.classList.remove('open');
   refreshAfterListMutation();
   toast('Lista renomeada');
@@ -1299,9 +1340,9 @@ function renderListActionsDelete(){
       <button class="pillbtn" id="confirmDeleteListBtn" style="flex:1; justify-content:center; background:#F0645C; border-color:#F0645C; color:#fff;">Excluir</button>
     </div>`;
   document.getElementById('cancelDeleteListBtn').addEventListener('click', renderListActionsMenu);
-  document.getElementById('confirmDeleteListBtn').addEventListener('click', () => {
+  document.getElementById('confirmDeleteListBtn').addEventListener('click', async () => {
     const deletedId = listActionsTargetId;
-    deleteList(deletedId);
+    await deleteList(deletedId);
     listActionsBackdrop.classList.remove('open');
     if(currentListId === deletedId){
       currentListId = null;
@@ -1331,9 +1372,8 @@ function renderListGrid(id){
       <button class="${sortOrder === 'oldest' ? 'active' : ''}" data-sort="oldest">Mais antigos primeiro</button>
     </div>`;
   document.querySelectorAll('#listToolbar [data-sort]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      list.sortOrder = btn.dataset.sort;
-      saveStore(store);
+    btn.addEventListener('click', async () => {
+      await setListSortOrder(id, btn.dataset.sort);
       renderListGrid(id);
     });
   });
@@ -1407,8 +1447,7 @@ async function renderListDiscoveryShelf(listId, albums){
   }).slice(0, 10);
   if(!discovered.length){ wrap.innerHTML = ''; return; }
 
-  discovered.forEach(upsertAlbumCache);
-  saveStore(store);
+  discovered.forEach(cacheAlbum);
   wrap.innerHTML = `
     <div class="section-title">Sugestões pra essa lista</div>
     <div class="grid">${discovered.map(suggestionCardHTML).join('')}</div>
@@ -1439,10 +1478,10 @@ function bindSuggestionCardEvents(container, listId){
     el.addEventListener('click', (e) => { e.stopPropagation(); openArtist(el.dataset.artistId); });
   });
   container.querySelectorAll('[data-suggest-add]').forEach(btn => {
-    btn.addEventListener('click', (e) => {
+    btn.addEventListener('click', async (e) => {
       e.stopPropagation();
       const albumId = btn.dataset.suggestAdd;
-      toggleAlbumInList(listId, albumId);
+      await toggleAlbumInList(listId, albumId);
       const card = btn.closest('.card');
       if(card) card.remove();
       refreshAfterListMutation();
@@ -1485,8 +1524,8 @@ function renderModalListRows(){
     </div>`;
   }).join('');
   wrap.querySelectorAll('.modal-listrow').forEach(row => {
-    row.addEventListener('click', () => {
-      toggleAlbumInList(row.dataset.listId, modalAlbumId);
+    row.addEventListener('click', async () => {
+      await toggleAlbumInList(row.dataset.listId, modalAlbumId);
       renderModalListRows();
       refreshAddButtons();
       refreshAfterListMutation();
@@ -1509,12 +1548,13 @@ function refreshAddButtons(){
 modalBackdrop.addEventListener('click', (e) => {
   if(e.target === modalBackdrop) modalBackdrop.classList.remove('open');
 });
-document.getElementById('modalNewListBtn').addEventListener('click', () => {
+document.getElementById('modalNewListBtn').addEventListener('click', async () => {
   const input = document.getElementById('modalNewListName');
   const name = input.value.trim();
   if(!name) return;
-  const id = createList(name);
-  toggleAlbumInList(id, modalAlbumId);
+  const id = await createList(name);
+  if(!id) return;
+  await toggleAlbumInList(id, modalAlbumId);
   input.value = '';
   renderModalListRows();
   refreshAddButtons();
@@ -1531,8 +1571,21 @@ if(SPOTIFY_CLIENT_SECRET === 'COLOQUE_SEU_CLIENT_SECRET_AQUI'){
       <a href="https://developer.spotify.com/dashboard" style="color:var(--accent)">Spotify Developer Dashboard</a>.
     </div>`;
 } else {
-  renderHome();
   showView('home', false);
+  document.getElementById('myAlbumsWrap').innerHTML = `<div class="grid-loading"><div class="spinner"></div></div>`;
+  bootstrapStore()
+    .then(() => {
+      renderHome();
+    })
+    .catch((err) => {
+      console.error(err);
+      document.querySelector('main').innerHTML = `
+        <div class="config-warning">
+          <b>Não deu pra conectar ao banco de dados.</b><br>
+          Confira se o SUPABASE_URL e o SUPABASE_ANON_KEY estão certos no <code>index.html</code>,
+          e se as tabelas já foram criadas no projeto Supabase.
+        </div>`;
+    });
 }
 
 if('serviceWorker' in navigator){
