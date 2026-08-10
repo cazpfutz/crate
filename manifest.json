@@ -4,11 +4,12 @@
   "description": "Organize álbuns em listas com nomes livres e navegue discografias em ordem cronológica.",
   "start_url": "./index.html",
   "display": "standalone",
-  "background_color": "#16130F",
-  "theme_color": "#16130F",
+  "background_color": "#0A0E16",
+  "theme_color": "#0A0E16",
   "orientation": "portrait",
   "icons": [
-    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
-    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
   ]
 }
