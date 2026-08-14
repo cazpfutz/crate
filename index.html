@@ -492,7 +492,7 @@ main{padding:4px 16px 24px;}
    nada mais sensível aqui.
    ========================================================= */
 const SPOTIFY_CLIENT_ID = 'f88babde854d48108ec6b440f1785c5a';
-const SPOTIFY_CLIENT_SECRET = '15648ab41ac64f0490874ca1e77e134a';
+const SPOTIFY_CLIENT_SECRET = 'COLOQUE_SEU_CLIENT_SECRET_AQUI';
 const LASTFM_API_KEY = '7b411ff45f35b3660a83fed213634a16';
 const SUPABASE_URL = 'https://kpromdiourvbwfawwoqc.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imtwcm9tZGlvdXJ2YndmYXd3b3FjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODYzNTM5NTcsImV4cCI6MjEwMTkyOTk1N30.PgY2nV9TGZPbTm9k31ud_55g_4eeW1YLJptUDSAUUno';
@@ -544,10 +544,18 @@ async function getArtist(id){
   return spotifyFetch(`/artists/${id}`);
 }
 async function getArtistAlbums(id){
-  let items = [];
-  let url = `/artists/${id}/albums?include_groups=album,single,compilation&limit=50&market=BR`;
-  const data = await spotifyFetch(url);
-  items = data.items;
+  const limit = 50;
+  const first = await spotifyFetch(`/artists/${id}/albums?include_groups=album,single,compilation&limit=${limit}&offset=0&market=BR`);
+  let items = [...first.items];
+  const total = first.total || items.length;
+  const remainingOffsets = [];
+  for(let offset = limit; offset < total; offset += limit) remainingOffsets.push(offset);
+  if(remainingOffsets.length){
+    const pages = await Promise.all(remainingOffsets.map(offset =>
+      spotifyFetch(`/artists/${id}/albums?include_groups=album,single,compilation&limit=${limit}&offset=${offset}&market=BR`)
+    ));
+    pages.forEach(p => { items = items.concat(p.items); });
+  }
   return items;
 }
 async function findTopAlbumForArtistName(name){
@@ -886,7 +894,7 @@ async function renderDiscoveryShelf(){
   `;
 
   const allArtists = Array.from(ownedArtistNames.values());
-  const seedArtists = allArtists.slice(0, 8);
+  const seedArtists = shuffled(allArtists).slice(0, 8);
 
   // Fonte 1: artistas parecidos (Last.fm)
   const similarLists = await Promise.all(seedArtists.map(name => getSimilarArtists(name, 6)));
@@ -918,7 +926,7 @@ async function renderDiscoveryShelf(){
     .sort((a,b) => a-b);
   const targetYear = years.length ? years[Math.floor(years.length/2)] : null;
 
-  const picks = candidateNames.slice(0, 55);
+  const picks = shuffled(candidateNames).slice(0, 55);
   const results = await Promise.all(picks.map(name => findAlbumForArtistNearYear(name, targetYear)));
   if(!document.getElementById('discoveryShelfWrap') || !document.getElementById('view-home').classList.contains('active')) return;
 
@@ -941,6 +949,14 @@ function allAlbumIdsFromStore(){
   const ids = new Set();
   Object.values(store.lists).forEach(list => list.albumIds.forEach(id => ids.add(id)));
   return ids;
+}
+function shuffled(array){
+  const a = array.slice();
+  for(let i = a.length - 1; i > 0; i--){
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
 }
 
 /* ---------------- Search ---------------- */
@@ -1133,6 +1149,11 @@ function formatDuration(ms){
 
 /* ---------------- Artist detail ---------------- */
 const DELUXE_HINTS = /deluxe|remaster|anniversary|edition|live|expanded|bonus|reissue|collector/i;
+// "Remaster" fica de fora do grupo acima: em vários catálogos antigos (Beatles, Dylan...)
+// é a ÚNICA versão disponível no Spotify, não uma edição extra — então só empurramos
+// pra "Outros lançamentos" se existir uma versão "sem remaster" concorrente do mesmo álbum.
+const HARD_HINTS = /deluxe|anniversary|edition|live|expanded|bonus|reissue|collector/i;
+const REMASTER_ONLY_HINT = /remaster/i;
 
 async function openArtist(id){
   currentArtistId = id;
@@ -1142,23 +1163,34 @@ async function openArtist(id){
   try{
     const [artist, albums] = await Promise.all([getArtist(id), getArtistAlbums(id)]);
 
-    // dedupe by normalized name, keep earliest release_date as representative
-    const byName = {};
+    // Agrupa por título-base (ignorando remaster/deluxe/etc) pra descobrir,
+    // por grupo, se existe uma versão "sem remaster" do mesmo álbum.
+    const groups = {};
     albums.forEach(a => {
       const key = a.name.toLowerCase().replace(DELUXE_HINTS,'').replace(/[^a-z0-9]/g,'');
-      if(!byName[key] || a.release_date < byName[key].release_date){
-        byName[key] = a;
+      if(!groups[key]) groups[key] = [];
+      groups[key].push(a);
+    });
+
+    const studio = [];
+    const others = [];
+    Object.values(groups).forEach(group => {
+      // representante do grupo: o de lançamento mais antigo
+      const representative = group.reduce((earliest, a) => (a.release_date < earliest.release_date ? a : earliest));
+      const hasHardHint = HARD_HINTS.test(representative.name);
+      const hasRemasterHint = REMASTER_ONLY_HINT.test(representative.name);
+      const hasPlainSibling = group.some(a => !HARD_HINTS.test(a.name) && !REMASTER_ONLY_HINT.test(a.name));
+
+      if(representative.album_type !== 'album' || hasHardHint || (hasRemasterHint && hasPlainSibling)){
+        others.push(representative);
+      } else {
+        studio.push(representative);
       }
     });
-    const deduped = Object.values(byName);
+    const deduped = [...studio, ...others];
 
-    const studio = deduped
-      .filter(a => a.album_type === 'album' && !DELUXE_HINTS.test(a.name))
-      .sort((a,b) => a.release_date.localeCompare(b.release_date));
-
-    const others = deduped
-      .filter(a => !studio.includes(a))
-      .sort((a,b) => a.release_date.localeCompare(b.release_date));
+    studio.sort((a,b) => a.release_date.localeCompare(b.release_date));
+    others.sort((a,b) => a.release_date.localeCompare(b.release_date));
 
     const photo = artist.images[0] ? artist.images[0].url : '';
 
@@ -1405,7 +1437,7 @@ async function renderListDiscoveryShelf(listId, albums){
   `;
 
   const ownedAlbumIds = new Set(albums.map(a => a.id));
-  const seedArtists = Array.from(ownedArtistNames.values()).slice(0, 5);
+  const seedArtists = shuffled(Array.from(ownedArtistNames.values())).slice(0, 5);
 
   // Fonte 1: artistas parecidos (similaridade colaborativa do Last.fm)
   const similarLists = await Promise.all(seedArtists.map(name => getSimilarArtists(name, 4)));
@@ -1435,7 +1467,7 @@ async function renderListDiscoveryShelf(listId, albums){
     .sort((a,b) => a-b);
   const targetYear = years.length ? years[Math.floor(years.length/2)] : null;
 
-  const picks = candidateNames.slice(0, 16); // margem extra, filtramos duplicados de álbum a seguir
+  const picks = shuffled(candidateNames).slice(0, 16); // margem extra, filtramos duplicados de álbum a seguir
   const results = await Promise.all(picks.map(name => findAlbumForArtistNearYear(name, targetYear)));
   if(!document.getElementById('listDiscoveryWrap') || currentListId !== listId) return;
 
